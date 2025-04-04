@@ -1,0 +1,19 @@
+# Crontab для автоматического сбора данных о TRON
+
+# Переменные окружения (укажите свои пути)
+TRON_WALLET_ADDRESS=TRaH4GZtNiTXfooiufvYyVhAY7fuhUrs2v
+SQLITE_DB_PATH=/path/to/tron_data.db
+PATH=/usr/local/bin:/usr/bin:/bin
+SHELL=/bin/bash
+
+# Собираем данные о транзакциях каждый час
+0 * * * * cd /path/to/tron-energy-tracker && source venv/bin/activate && python tron_historical_data.py --hours 2 >> logs/tron_hourly_$(date +\%Y\%m\%d).log 2>&1
+
+# Собираем данные о курсах валют каждые 6 часов
+0 */6 * * * cd /path/to/tron-energy-tracker && source venv/bin/activate && python tron_historical_data.py --currency-rates >> logs/currency_rates_$(date +\%Y\%m\%d).log 2>&1
+
+# Собираем данные за последние сутки раз в день в полночь
+0 0 * * * cd /path/to/tron-energy-tracker && source venv/bin/activate && python tron_historical_data.py --days 1 --period day >> logs/tron_daily_$(date +\%Y\%m\%d).log 2>&1
+
+# Ротация логов раз в месяц
+0 0 1 * * find /path/to/tron-energy-tracker/logs -name "*.log" -type f -mtime +30 -delete
