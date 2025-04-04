@@ -103,19 +103,6 @@ def initialize_sqlite_db():
             )
         ''')
         
-        # Создаем таблицу для хранения курсов валют относительно USDT
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS tron_currency_rates (
-                timestamp INTEGER,
-                date TEXT,
-                symbol TEXT,
-                price_usdt REAL,
-                volume_24h REAL,
-                change_24h REAL,
-                PRIMARY KEY (date, symbol)
-            )
-        ''')
-        
         conn.commit()
         logger.info("База данных SQLite инициализирована")
         return True
@@ -285,58 +272,131 @@ def save_transactions_to_sqlite(transactions):
     logger.info(f"Записано {success_count} транзакций в SQLite, ошибок: {error_count}")
     return success_count, error_count
 
+def get_last_transaction_date():
+    """Получает дату последней транзакции из базы данных"""
+    conn = None
+    try:
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        cursor = conn.cursor()
+        
+        # Проверяем последнюю транзакцию
+        cursor.execute('''
+            SELECT MAX(timestamp) FROM tron_transactions
+        ''')
+        last_timestamp = cursor.fetchone()[0]
+        
+        return last_timestamp if last_timestamp else None
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при получении последней даты из базы: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def check_transactions_exist(start_timestamp, end_timestamp):
+    """Проверяет наличие транзакций в базе данных для указанного периода"""
+    conn = None
+    try:
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        cursor = conn.cursor()
+        
+        # Проверяем количество транзакций в периоде
+        cursor.execute('''
+            SELECT COUNT(*) FROM tron_transactions 
+            WHERE timestamp >= ? AND timestamp <= ?
+        ''', (start_timestamp, end_timestamp))
+        count = cursor.fetchone()[0]
+        
+        return count > 0
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при проверке существующих транзакций: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
 def get_historical_transactions(hours=None, days=None):
     """Получает исторические транзакции за указанное количество часов или дней"""
     end_time = int(time.time() * 1000)  # Текущее время в миллисекундах
     
     if hours is not None:
         # Рассчитываем временной интервал в часах
-        start_time = end_time - (hours * 60 * 60 * 1000)
+        total_interval = hours * 60 * 60 * 1000
         time_desc = f"{hours} час(ов)"
     elif days is not None:
         # Рассчитываем временной интервал в днях
-        start_time = end_time - (days * 24 * 60 * 60 * 1000)
+        total_interval = days * 24 * 60 * 60 * 1000
         time_desc = f"{days} дней"
     else:
         # По умолчанию - 1 день
-        start_time = end_time - (24 * 60 * 60 * 1000)
+        total_interval = 24 * 60 * 60 * 1000
         time_desc = "1 день"
     
+    # Проверяем последнюю дату в базе
+    last_timestamp = get_last_transaction_date()
+    if last_timestamp:
+        logger.info(f"Найдены существующие данные до {datetime.fromtimestamp(last_timestamp/1000)}")
+        # Начинаем с последней известной даты
+        end_time = last_timestamp
+    
+    start_time = end_time - total_interval
+    original_start_time = start_time
+    
+    # Размер одного временного окна (7 дней)
+    window_size = 7 * 24 * 60 * 60 * 1000
+    
     all_transactions = []
-    total_count = 0
-    page_size = 50
-    page = 0
+    current_window_end = end_time
     
-    # Получаем общее количество транзакций
-    _, total_tx = get_transactions(start_time, end_time, 1, 0)
-    
-    if total_tx == 0:
-        logger.info(f"За последние {time_desc} транзакций не найдено")
-        return all_transactions
-    
-    logger.info(f"Всего найдено {total_tx} транзакций за последние {time_desc}")
-    
-    # Получаем транзакции постранично
-    while True:
-        transactions, _ = get_transactions(start_time, end_time, page_size, page * page_size)
-        if not transactions:
-            break
+    while current_window_end > original_start_time:
+        current_window_start = max(original_start_time, current_window_end - window_size)
         
-        # Обрабатываем и добавляем данные
-        for tx in transactions:
-            tx_data = extract_transaction_data(tx)
-            all_transactions.append(tx_data)
+        # Проверяем, есть ли уже данные за этот период
+        if check_transactions_exist(current_window_start, current_window_end):
+            logger.info(f"Пропуск периода {datetime.fromtimestamp(current_window_start/1000)} - {datetime.fromtimestamp(current_window_end/1000)}: данные уже существуют")
+            current_window_end = current_window_start
+            continue
         
-        total_count += len(transactions)
-        logger.info(f"Получено {len(transactions)} транзакций (страница {page+1}), всего: {total_count}")
+        logger.info(f"Обработка периода: {datetime.fromtimestamp(current_window_start/1000)} - {datetime.fromtimestamp(current_window_end/1000)}")
         
-        if len(transactions) < page_size or total_count >= total_tx:
-            break
+        # Получаем транзакции для текущего окна
+        window_transactions = []
+        page = 0
+        page_size = 50
         
-        page += 1
-        time.sleep(0.5)  # Небольшая задержка, чтобы не перегружать API
+        while True:
+            transactions, total_tx = get_transactions(current_window_start, current_window_end, page_size, page * page_size)
+            if not transactions:
+                break
+            
+            # Обрабатываем и добавляем данные
+            for tx in transactions:
+                tx_data = extract_transaction_data(tx)
+                window_transactions.append(tx_data)
+            
+            logger.info(f"Получено {len(transactions)} транзакций (страница {page+1}), всего в текущем окне: {len(window_transactions)}")
+            
+            if len(transactions) < page_size:
+                break
+                
+            page += 1
+            time.sleep(0.5)  # Небольшая задержка между запросами
+        
+        # Добавляем транзакции текущего окна к общему списку
+        if window_transactions:
+            all_transactions.extend(window_transactions)
+            logger.info(f"В текущем окне найдено {len(window_transactions)} транзакций")
+        else:
+            logger.info("В текущем окне транзакций не найдено")
+        
+        # Сдвигаем окно назад во времени
+        current_window_end = current_window_start
+        
+        # Если в текущем окне не было транзакций, возможно есть смысл увеличить размер окна
+        if not window_transactions:
+            window_size = min(window_size * 2, total_interval)  # Увеличиваем окно, но не больше общего интервала
     
-    logger.info(f"Всего получено {total_count} транзакций за последние {time_desc}")
+    logger.info(f"Всего получено {len(all_transactions)} новых транзакций за последние {time_desc}")
     return all_transactions
 
 def create_time_period_key(timestamp, period_type):
@@ -483,78 +543,6 @@ def save_energy_stats_to_sqlite(energy_stats, contract_stats):
         if conn:
             conn.close()
 
-def get_currency_rates():
-    """Получает текущие курсы валют относительно USDT"""
-    url = "https://apilist.tronscanapi.com/api/token/price"
-    
-    data = make_api_request(url)
-    if not data or "data" not in data:
-        logger.error("Не удалось получить данные о курсах валют")
-        return []
-    
-    currency_rates = []
-    current_time = int(time.time() * 1000)
-    current_date = datetime.fromtimestamp(current_time / 1000).strftime("%Y-%m-%d")
-    
-    # Обрабатываем курсы валют
-    for rate_data in data["data"]:
-        symbol = rate_data.get("symbol", "")
-        if not symbol:
-            continue
-        
-        # Собираем данные о курсе
-        currency_rate = {
-            "timestamp": current_time,
-            "date": current_date,
-            "symbol": symbol,
-            "price_usdt": float(rate_data.get("priceInUsd", 0)),
-            "volume_24h": float(rate_data.get("volume24h", 0)),
-            "change_24h": float(rate_data.get("percentChange24h", 0))
-        }
-        
-        currency_rates.append(currency_rate)
-    
-    logger.info(f"Получено {len(currency_rates)} курсов валют")
-    return currency_rates
-
-def save_currency_rates_to_sqlite(currency_rates):
-    """Сохраняет курсы валют в SQLite"""
-    if not currency_rates:
-        logger.warning("Нет данных о курсах валют для сохранения")
-        return 0
-    
-    conn = None
-    success_count = 0
-    
-    try:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
-        cursor = conn.cursor()
-        
-        for rate in currency_rates:
-            cursor.execute('''
-                INSERT OR REPLACE INTO tron_currency_rates
-                (timestamp, date, symbol, price_usdt, volume_24h, change_24h)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                rate["timestamp"],
-                rate["date"],
-                rate["symbol"],
-                rate["price_usdt"],
-                rate["volume_24h"],
-                rate["change_24h"]
-            ))
-            success_count += 1
-        
-        conn.commit()
-        logger.info(f"Сохранено {success_count} курсов валют в SQLite")
-        return success_count
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка сохранения курсов валют в SQLite: {e}")
-        return 0
-    finally:
-        if conn:
-            conn.close()
-
 def main():
     parser = argparse.ArgumentParser(description="Сбор данных о транзакциях и энергии TRON кошелька")
     
@@ -564,7 +552,6 @@ def main():
     
     parser.add_argument("--period", choices=["hour", "day", "month"], default="hour", 
                         help="Тип периода для агрегации статистики (по умолчанию: hour)")
-    parser.add_argument("--currency-rates", action="store_true", help="Получить текущие курсы валют")
     
     args = parser.parse_args()
     
@@ -572,11 +559,6 @@ def main():
     if not initialize_sqlite_db():
         logger.error("Не удалось инициализировать базу данных SQLite. Завершаем работу.")
         sys.exit(1)
-    
-    # Получаем курсы валют, если запрошено
-    if args.currency_rates:
-        currency_rates = get_currency_rates()
-        save_currency_rates_to_sqlite(currency_rates)
     
     # Получаем исторические транзакции
     transactions = get_historical_transactions(hours=args.hours, days=args.days)
