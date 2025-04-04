@@ -8,6 +8,7 @@ import logging
 import argparse
 import sqlite3
 from datetime import datetime, timedelta
+import random
 
 # Настройка логирования
 logging.basicConfig(
@@ -27,7 +28,17 @@ TRONSCAN_API_URL = "https://apilist.tronscanapi.com/api"
 
 # Максимальное количество попыток для API запросов
 MAX_RETRIES = 3
-RETRY_DELAY = 2  # секунды
+MIN_RETRY_DELAY = 5  # минимальная задержка в секундах
+MAX_RETRY_DELAY = 15  # максимальная задержка в секундах
+
+# Заголовки для HTTP запросов
+HTTP_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://tronscan.org',
+    'Referer': 'https://tronscan.org/'
+}
 
 def initialize_sqlite_db():
     """Инициализирует базу данных SQLite и создает необходимые таблицы"""
@@ -117,13 +128,30 @@ def make_api_request(url, params=None, retries=MAX_RETRIES):
     """Выполняет запрос к API с повторными попытками при неудаче"""
     for attempt in range(retries):
         try:
-            response = requests.get(url, params=params)
+            # Случайная задержка между запросами
+            delay = random.uniform(MIN_RETRY_DELAY, MAX_RETRY_DELAY)
+            if attempt > 0:
+                logger.info(f"Ожидание {delay:.2f} секунд перед повторной попыткой...")
+                time.sleep(delay)
+            
+            response = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=30)
+            
+            # Если получили 403, делаем более длительную паузу
+            if response.status_code == 403:
+                logger.warning(f"Получен код 403 (попытка {attempt+1}/{retries}). Возможно, превышен лимит запросов.")
+                if attempt < retries - 1:
+                    extended_delay = random.uniform(MAX_RETRY_DELAY * 2, MAX_RETRY_DELAY * 4)
+                    logger.info(f"Ожидание {extended_delay:.2f} секунд перед следующей попыткой...")
+                    time.sleep(extended_delay)
+                continue
+            
             response.raise_for_status()
             return response.json()
+            
         except requests.RequestException as e:
             logger.warning(f"Ошибка API запроса (попытка {attempt+1}/{retries}): {e}")
             if attempt < retries - 1:
-                time.sleep(RETRY_DELAY)
+                continue
             else:
                 logger.error(f"Не удалось выполнить запрос после {retries} попыток: {url}")
                 return None
@@ -140,6 +168,10 @@ def get_transactions(start_timestamp, end_timestamp, limit=50, start=0):
         "sort": "-timestamp",
         "count": True
     }
+    
+    logger.info(f"Запрос транзакций: start_timestamp={datetime.fromtimestamp(start_timestamp/1000)}, "
+                f"end_timestamp={datetime.fromtimestamp(end_timestamp/1000)}, "
+                f"start={start}, limit={limit}")
     
     data = make_api_request(url, params)
     if data and "data" in data:
@@ -380,12 +412,19 @@ def get_historical_transactions(hours=None, days=None):
                 break
                 
             page += 1
-            time.sleep(0.5)  # Небольшая задержка между запросами
+            # Задержка между запросами страниц
+            delay = random.uniform(MIN_RETRY_DELAY, MAX_RETRY_DELAY)
+            logger.info(f"Ожидание {delay:.2f} секунд перед следующим запросом...")
+            time.sleep(delay)
         
         # Добавляем транзакции текущего окна к общему списку
         if window_transactions:
             all_transactions.extend(window_transactions)
             logger.info(f"В текущем окне найдено {len(window_transactions)} транзакций")
+            
+            # Сохраняем транзакции текущего окна
+            success_tx, error_tx = save_transactions_to_sqlite(window_transactions)
+            logger.info(f"Сохранено {success_tx} транзакций из текущего окна, ошибок: {error_tx}")
         else:
             logger.info("В текущем окне транзакций не найдено")
         
@@ -395,6 +434,7 @@ def get_historical_transactions(hours=None, days=None):
         # Если в текущем окне не было транзакций, возможно есть смысл увеличить размер окна
         if not window_transactions:
             window_size = min(window_size * 2, total_interval)  # Увеличиваем окно, но не больше общего интервала
+            logger.info(f"Размер окна увеличен до {window_size/(24*60*60*1000):.1f} дней")
     
     logger.info(f"Всего получено {len(all_transactions)} новых транзакций за последние {time_desc}")
     return all_transactions
@@ -566,9 +606,6 @@ def main():
         logger.warning("Не найдено транзакций за указанный период.")
         sys.exit(0)
     
-    # Сохраняем данные о транзакциях в SQLite
-    success_tx, error_tx = save_transactions_to_sqlite(transactions)
-    
     # Создаем и сохраняем статистику использования энергии
     energy_stats, contract_stats = generate_energy_statistics(transactions, args.period)
     save_energy_stats_to_sqlite(energy_stats, contract_stats)
@@ -584,7 +621,7 @@ def main():
         logger.info(f"- Общее использование энергии: {total_energy}")
         logger.info(f"- Общая стоимость энергии: {total_energy_fee} TRX")
     
-    logger.info(f"Сбор данных завершен: {success_tx} транзакций обработано")
+    logger.info(f"Сбор данных завершен успешно")
 
 if __name__ == "__main__":
     main()
